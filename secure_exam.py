@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-secure_exam.py - Secure examination-paper exchange (hybrid RSA + AES-GCM + RSA-PSS)
+secure_exam_colab.py - Secure examination-paper exchange (hybrid RSA + AES-GCM + RSA-PSS)
 
 Library: `cryptography` (pyca) - an established, audited cryptographic library.
 
@@ -10,7 +10,9 @@ Primitives
   * RSA-OAEP (SHA-256/MGF1): protects the AES session key for the recipient
   * RSA-PSS  (SHA-256)     : sender's signature over the whole package
 
-Usage
+Colab / Jupyter: just run the cell - it runs the demo automatically (no arguments needed).
+
+Command-line usage (terminal only)
   python secure_exam.py keygen  --name faculty   --out sender/keys
   python secure_exam.py encrypt --in paper.pdf --sender-id faculty --recipient-id coordinator \
          --sender-key sender/keys/faculty_private.pem --recipient-pub sender/trusted/coordinator_public.pem \
@@ -276,5 +278,83 @@ def main():
         print(f"[ERROR] {type(exc).__name__}: {exc}", file=sys.stderr); sys.exit(1)
 
 
+# --------------------------------------------------------------------------- #
+# DEMO (runs automatically in Colab / Jupyter, or when no CLI arguments are given)
+# --------------------------------------------------------------------------- #
+def run_demo():
+    import copy, hashlib, shutil
+
+    PASS = b"demo-passphrase"
+    root = Path("exam_demo")
+    shutil.rmtree(root, ignore_errors=True)
+    for d in ("sender/keys", "recipient/keys", "recipient/trusted", "sender/trusted",
+              "recipient/inbox", "channel", "attacker/keys"):
+        (root / d).mkdir(parents=True, exist_ok=True)
+
+    print(f"Generating RSA-{RSA_BITS} keys (takes a few seconds each)...")
+    s_priv, s_pub = generate_keypair("faculty", root / "sender/keys", PASS)
+    r_priv, r_pub = generate_keypair("coordinator", root / "recipient/keys", PASS)
+    a_priv, a_pub = generate_keypair("attacker", root / "attacker/keys", PASS)
+    shutil.copy(s_pub, root / "recipient/trusted/faculty_public.pem")      # trusted key exchange
+    shutil.copy(r_pub, root / "sender/trusted/coordinator_public.pem")
+    good_spub = root / "recipient/trusted/faculty_public.pem"
+    coord_pub = root / "sender/trusted/coordinator_public.pem"
+
+    paper = root / "exam_paper.txt"
+    paper.write_text("CONFIDENTIAL EXAM PAPER\nQ1. Explain AES-GCM.\nQ2. Explain RSA-PSS.\n")
+    sha = lambda p: hashlib.sha256(Path(p).read_bytes()).hexdigest()
+    pkg_path = root / "channel/exam_paper.pkg"
+    pkg = encrypt_file(paper, pkg_path, "faculty", "coordinator", s_priv, coord_pub, PASS)
+    inbox = root / "recipient/inbox"
+
+    def attempt(label, path, rkey, spub):
+        try:
+            dest, _ = decrypt_file(path, inbox, rkey, spub, PASS, "coordinator")
+            print(f"  {label}: ACCEPTED -> {dest}")
+            return dest
+        except VerificationError as e:
+            print(f"  {label}: [REJECTED] {e}")
+            return None
+
+    def flip(p, field):
+        p = copy.deepcopy(p)
+        raw = bytearray(b64d(p[field])); raw[len(raw) // 2] ^= 1
+        p[field] = b64e(bytes(raw)); return p
+
+    print("\nTEST 1: authorised recipient recovers the original file")
+    d = attempt("coordinator", pkg_path, r_priv, good_spub)
+    print("  SHA-256 identical to original:", d is not None and sha(d) == sha(paper))
+    if d: d.unlink()
+
+    print("\nTEST 2: attacker modifies the package")
+    m = copy.deepcopy(pkg); m["metadata"]["filename"] = "answer_key.txt"
+    for label, bad in {"ciphertext modified": flip(pkg, "ciphertext"),
+                       "signature modified": flip(pkg, "signature"),
+                       "metadata modified": m}.items():
+        bp = root / "channel/tampered.pkg"; bp.write_text(json.dumps(bad))
+        attempt(label, bp, r_priv, good_spub)
+
+    print("\nTEST 3: wrong recipient private key")
+    attempt("attacker key", pkg_path, a_priv, good_spub)
+
+    print("\nTEST 4: wrong sender public key")
+    attempt("attacker public key", pkg_path, r_priv, a_pub)
+
+    print("\nTEST 5: same file encrypted twice")
+    pkg2 = encrypt_file(paper, root / "channel/exam_paper_2.pkg", "faculty", "coordinator", s_priv, coord_pub, PASS)
+    for k in ("encrypted_session_key", "nonce", "ciphertext", "tag", "signature"):
+        print(f"  {k:<22}: {'DIFFERENT' if pkg[k] != pkg2[k] else 'SAME (problem)'}")
+
+    print("\ninbox after all attacks:", sorted(os.listdir(inbox)) or "EMPTY (no unverified plaintext released)")
+
+
+def in_notebook() -> bool:
+    return "ipykernel" in sys.modules or "google.colab" in sys.modules
+
+
 if __name__ == "__main__":
-    main()
+    # Colab/Jupyter put their own arguments in sys.argv, so argparse must not run there.
+    if in_notebook() or len(sys.argv) == 1:
+        run_demo()
+    else:
+        main()
